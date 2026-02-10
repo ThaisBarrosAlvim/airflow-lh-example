@@ -1,0 +1,4 @@
+pendulum
+python-dotenv
+pandas
+apache-airflow-providers-docker

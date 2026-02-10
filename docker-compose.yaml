@@ -1,0 +1,144 @@
+# Configuração Comum
+x-airflow-common:
+  &airflow-common
+  build: .
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor # Executa as tasks como processos locais. Ideal para testes e pequenas cargas.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: '' # Chave para criptografia de logs e conexões
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW__FAB__UPDATE_FAB_PERMS: 'true'
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./plugins:/opt/airflow/plugins
+    - ./.env:/opt/airflow/.env  # Mapeando .env para utilização interna
+    - ./outputs:/opt/airflow/outputs # Diretorio para salvar saida de DAGs
+    - /var/run/docker.sock:/var/run/docker.sock # Permite que o Airflow controle o Docker do host
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    &airflow-common-depends-on
+    postgres:
+      condition: service_healthy
+
+services:
+  postgres:
+    image: postgres:13
+    container_name: airflow_postgres
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    container_name: airflow_webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    container_name: airflow_scheduler
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 30s
+      retries: 5
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    container_name: airflow_init
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/{logs,dags,plugins,config}
+        
+        # Altera as permissões das pastas montadas para o usuário do airflow
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/
+        
+        # Inicializa o banco de dados (migrações)
+        airflow db migrate
+        
+        # Cria o usuário Admin para acesso à interface web
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Admin \
+          --lastname User \
+          --role Admin \
+          --email admin@example.com
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_WWW_USER_CREATE: 'true'
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+    user: "0:0"
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+
+volumes:
+  postgres-db-volume:
+
+# Outros serviços:
+# services:
+#   # BROKER (Redis ou RabbitMQ)
+#   # Necessário apenas se usar CeleryExecutor (distribuição de tarefas). Serve como fila de mensagens
+#   # O Scheduler manda a tarefa para o Redis, e o Worker pega do Redis para executar
+#   redis:
+#     image: redis:latest
+#     # ...
+#
+#   # WORKER
+#   # O componente que realmente executa o código bruto Python das DAGs
+#   # Ele escuta o Redis, pega uma tarefa pendente e a processa.
+#   # Você pode ter 1, 10 ou 100 workers em máquinas diferentes (escalabilidade horizontal)
+#   airflow-worker:
+#     image: apache/airflow:latest
+#     command: celery worker
+#     environment:
+#       AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+#       # ... mesmas conexões de DB e Redis ...
+#     depends_on:
+#       - postgres
+#       - redis
+#
+#   # TRIGGERER (Otimização)
+#   # Exemplo: Você rodou um processo que roda externamente e demora muito.
+#   # - SEM Triggerer: O Worker fica parado 5h verificando se acabou, gastando um worker sem processamento real.
+#   # - COM Triggerer: O Worker dispara o job e libera a vaga para outro worker
+#   # O Triggerer assume o monitoramento e devolve o fluxo pro Worker só quando acabar.
+#   airflow-triggerer:
+#     image: apache/airflow:latest
+#     command: triggerer
+#     # ...
